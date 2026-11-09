@@ -1,0 +1,12 @@
+{
+  "name": "joomla-k2-finder",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Passive public-page Joomla/K2 discovery and prospect qualification",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node finder.mjs --input domains.txt --output results.csv --leads leads.csv --ru-only",
+    "test": "node --test"
+  }
+}
