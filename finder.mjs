@@ -77,7 +77,6 @@ export function normalizeCachedRow(input) {
     isLegacyOpenCartCandidate(row) ? (row.opencart_legacy === 'yes' &&
       row.opencart_version_confidence === 'high' ? 'high' : 'medium') : 'low');
   row.lead_technology = leadTechnology(row);
-  row.lead_technology = leadTechnology(row);
   row.lead_priority = prospectPriority(row);
   row.priority = row.technical_priority; // backward-compatible alias
   return row;
