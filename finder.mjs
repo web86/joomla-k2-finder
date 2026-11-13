@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Joomla K2 Finder — passive, low-rate public-HTML technology detector.
+ * Legacy CMS Finder — passive, low-rate public-HTML technology detector.
  * Node.js 22+, no third-party packages.
  * No vulnerability scans, authentication, directory enumeration, or form submissions.
  */
@@ -9,17 +9,29 @@ import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import { pathToFileURL } from 'node:url';
 
-const USER_AGENT = 'JoomlaK2Finder/1.1 (public-pages-research; contact site owner for an audit)';
+const USER_AGENT = 'JoomlaK2Finder/1.2 (public-pages-research; contact site owner for an audit)';
 const ROBOT_AGENT = 'JoomlaK2Finder';
-const DEFAULTS = { delay: 1500, timeout: 10000, maxPages: 3, maxSites: 100, manifest: false, ruOnly: false, retryErrors: false, fresh: false };
+const DEFAULTS = { delay: 1500, timeout: 10000, maxPages: 3, maxSites: 100, manifest: false, ruOnly: false, retryErrors: false, rescanOpenCart: false, fresh: false };
 export const FIELDS = [
   'domain','site_url','site_title','company_name','business_type','joomla_detected','k2_detected',
   'k2_confidence','joomla_version','version_confidence','version_source',
-  'technical_priority','lead_priority','priority','contact_url','pages_checked',
+  'opencart_detected','opencart_confidence','opencart_version','opencart_version_confidence','opencart_legacy',
+  'technical_priority','lead_priority','lead_technology','priority','contact_url','pages_checked',
   'robots_status','scan_status','evidence','error','checked_at'
 ];
 export const LEAD_FIELDS = FIELDS;
 const NON_BUSINESS = new Set(['media','ngo','government','personal','other']);
+
+export function isLegacyOpenCartCandidate(row) {
+  return row.opencart_detected === 'yes' && ['yes', 'possible'].includes(row.opencart_legacy);
+}
+
+export function leadTechnology(row) {
+  const technologies = [];
+  if (row.k2_detected === 'yes') technologies.push('joomla_k2');
+  if (isLegacyOpenCartCandidate(row)) technologies.push('opencart_legacy');
+  return technologies.join('+');
+}
 
 export function isRussianDomain(domain) {
   return /\.(?:ru|xn--p1ai)$/i.test(String(domain || ''));
@@ -33,29 +45,39 @@ export function businessType(value) {
 // A prospect score describes *technical fit*, not commercial viability or a security finding.
 export function prospectPriority(row) {
   const type = businessType(row.business_type);
-  if (row.scan_status !== 'ok' || row.k2_detected !== 'yes' || NON_BUSINESS.has(type)) return 'low';
+  if (row.scan_status !== 'ok' || (!leadTechnology(row)) || NON_BUSINESS.has(type)) return 'low';
   if (type === 'unknown') return 'review';
-  if (row.version_confidence === 'conflict') return 'review';
+  if ((row.k2_detected === 'yes' && row.version_confidence === 'conflict') ||
+    row.opencart_version_confidence === 'conflict' || row.technical_priority === 'review') return 'review';
   return row.technical_priority === 'high' && !!row.contact_url ? 'high' : 'medium';
 }
 
 export function eligibleLead(row) {
   return isRussianDomain(row.domain) && row.scan_status === 'ok' &&
-    row.k2_detected === 'yes' && !NON_BUSINESS.has(businessType(row.business_type));
+    !!leadTechnology(row) && !NON_BUSINESS.has(businessType(row.business_type));
 }
 
 export function normalizeCachedRow(input) {
   const row = { ...input };
   const ok = row.scan_status === 'ok';
-  for (const field of ['joomla_detected','k2_detected']) {
+  for (const field of ['joomla_detected','k2_detected','opencart_detected']) {
     const val = String(row[field] ?? '').toLowerCase();
     row[field] = !ok ? 'unknown' : (val === 'true' || val === 'yes' ? 'yes' : val === 'false' || val === 'no' ? 'no' : 'unknown');
   }
   row.business_type = businessType(row.business_type);
   row.company_name = row.company_name || '';
   row.k2_confidence ||= row.k2_detected === 'yes' ? 'medium' : 'unknown';
-  row.technical_priority ||= (row.priority === 'review' ? 'review' : row.k2_detected === 'yes' ?
-    (row.version_confidence === 'conflict' ? 'review' : (row.version_confidence === 'high' && /^[123]\./.test(row.joomla_version) ? 'high' : 'medium')) : 'low');
+  row.opencart_confidence ||= row.opencart_detected === 'yes' ? 'medium' : 'unknown';
+  row.opencart_version ||= 'unknown';
+  row.opencart_version_confidence ||= 'unknown';
+  row.opencart_legacy ||= 'unknown';
+  row.technical_priority ||= (row.priority === 'review' ? 'review' :
+    row.k2_detected === 'yes' ? (row.version_confidence === 'conflict' ? 'review' :
+      (row.version_confidence === 'high' && /^[123]\./.test(row.joomla_version) ? 'high' : 'medium')) :
+    isLegacyOpenCartCandidate(row) ? (row.opencart_legacy === 'yes' &&
+      row.opencart_version_confidence === 'high' ? 'high' : 'medium') : 'low');
+  row.lead_technology = leadTechnology(row);
+  row.lead_technology = leadTechnology(row);
   row.lead_priority = prospectPriority(row);
   row.priority = row.technical_priority; // backward-compatible alias
   return row;
@@ -269,14 +291,34 @@ export function parsePage(html, pageUrl) {
   ];
   const kinds = new Set();
   for (const [re, label, kind] of signatures) if (re.test(html)) { push(kind, label); kinds.add(kind); }
-  let versionFromMeta = '';
+  // A route alone is weak (also exists in OpenCart 4 and custom sites).
+  // /catalog/view/theme/... indicates the pre-4 storefront asset layout, NOT an exact 1.x/2.x version.
+  const ocSignatures = [
+    [/\/catalog\/view\/theme\/[a-z0-9_-]+\/stylesheet\/stylesheet\.css\b/i, 'OpenCart:pre4_theme_css', 'oc_pre4'],
+    [/\/catalog\/view\/javascript\/jquery\/jquery-1\.[78]\.\d+(?:\.min)?\.js\b/i, 'OpenCart:early_jquery_asset', 'oc_early'],
+    [/\/catalog\/view\/javascript\/common\.js\b/i, 'OpenCart:common_js', 'oc_support'],
+    [/\/catalog\/view\/javascript\/bootstrap\/css\/bootstrap(?:\.min)?\.css\b/i, 'OpenCart:catalog_bootstrap', 'oc_support'],
+    [/[?&](?:amp;)?route=(?:product\/product|product\/category|checkout\/cart|account\/login)\b/i, 'OpenCart:catalog_route', 'oc_route'],
+  ];
+  for (const [re, label, kind] of ocSignatures) if (re.test(html)) { push(kind, label); kinds.add(kind); }
+  if (/Powered\s+by\s*(?:<[^>]+>\s*)?OpenCart\b/i.test(html)) {
+    push('opencart', 'OpenCart:powered_by');
+    kinds.add('opencart');
+  }
+  let versionFromMeta = '', openCartMetaVersion = '';
   for (const tag of html.match(/<meta\b[^>]*>/gi) || []) {
     if (attribute(tag, 'name').toLowerCase() !== 'generator') continue;
     const content = attribute(tag, 'content');
-    if (!/joomla/i.test(content)) continue;
-    kinds.add('joomla');
-    push('joomla', `generator:${content.slice(0, 90)}`);
-    versionFromMeta = content.match(/\bjoomla!?\s*[-:]?\s*v?(\d+(?:\.\d+){1,3})\b/i)?.[1] ?? '';
+    if (/joomla/i.test(content)) {
+      kinds.add('joomla');
+      push('joomla', `generator:${content.slice(0, 90)}`);
+      versionFromMeta = content.match(/\bjoomla!?\s*[-:]?\s*v?(\d+(?:\.\d+){1,3})\b/i)?.[1] ?? '';
+    }
+    if (/\b(?:opencart|ocstore)\b/i.test(content)) {
+      kinds.add('opencart');
+      push('opencart', `generator:${content.slice(0, 90)}`);
+      openCartMetaVersion = content.match(/\b(?:opencart|ocstore)\s*[-:]?\s*v?(\d+(?:\.\d+){1,3})\b/i)?.[1] ?? '';
+    }
   }
   if (kinds.has('k2')) kinds.add('joomla');
   const links = [];
@@ -295,7 +337,7 @@ export function parsePage(html, pageUrl) {
     if (/option=com_k2|\/component\/k2\/|\/catalog(?:ue)?\/|\/uslug|\/services?\/|\/products?\/|\/news\/|\/blog\/|\/company\/|\/about\/|\/item\//i.test(abs.href))
       links.push(abs.href);
   }
-  return { title, evidence, kinds, versionFromMeta, links: [...new Set(links)], contactUrl };
+  return { title, evidence, kinds, versionFromMeta, openCartMetaVersion, links: [...new Set(links)], contactUrl };
 }
 
 export function parseJoomlaManifest(xml) {
@@ -331,14 +373,46 @@ export function classify(pages, manifestVersion = '') {
     else if (k2) { version = '3.x or earlier (hypothesis)'; confidence = 'low'; source = 'k2_compatibility'; }
   }
   const joomla = kinds.has('joomla') || kinds.has('j2') || kinds.has('j3') || kinds.has('j4plus') || kinds.has('legacy') || k2 || !!manifestVersion;
+  const openCart = kinds.has('opencart') || kinds.has('oc_pre4') || kinds.has('oc_early') ||
+    (kinds.has('oc_support') && kinds.has('oc_route'));
+  const ocMetaVersions = [...new Set(pages.map(p => p.openCartMetaVersion).filter(Boolean))];
+  let ocVersion = 'unknown', ocVersionConfidence = 'unknown', ocLegacy = 'unknown';
+  if (ocMetaVersions.length > 1) {
+    ocVersion = ocMetaVersions.join(' / ');
+    ocVersionConfidence = 'conflict';
+  } else if (ocMetaVersions.length === 1) {
+    ocVersion = ocMetaVersions[0];
+    ocVersionConfidence = 'high';
+    const major = Number(ocVersion.split('.')[0]);
+    ocLegacy = major >= 1 && major <= 3 ? 'yes' : major >= 4 ? 'no' : 'unknown';
+    if (major >= 4 && (kinds.has('oc_pre4') || kinds.has('oc_early'))) {
+      // Old assets may be carried forward after an upgrade: flag conflicting evidence.
+      ocVersionConfidence = 'conflict';
+      ocLegacy = 'unknown';
+    }
+  } else if (kinds.has('oc_pre4')) {
+    ocVersion = '1.x–3.x (asset hypothesis)';
+    ocVersionConfidence = 'low';
+    ocLegacy = 'possible';
+  } else if (kinds.has('oc_early')) {
+    ocVersion = '1.x–2.x (asset hypothesis)';
+    ocVersionConfidence = 'low';
+    ocLegacy = 'possible';
+  }
+  const ocConfidence = !openCart ? 'unknown' :
+    (kinds.has('opencart') || kinds.has('oc_pre4') || kinds.has('oc_early') ? 'high' : 'medium');
   if (manifestVersion) signals.push(`Joomla core manifest:${manifestVersion}`);
   let priority = 'low';
   if (k2 && confidence === 'conflict') priority = 'review';
   else if (k2 && confidence === 'high' && /^[123]\./.test(version)) priority = 'high';
   else if (k2) priority = 'medium';
+  if (openCart && ocLegacy === 'yes' && ocVersionConfidence === 'high') priority = 'high';
+  else if (openCart && ocLegacy === 'possible' && priority === 'low') priority = 'medium';
   return { joomla_detected: joomla ? 'yes' : 'no', k2_detected: k2 ? 'yes' : 'no',
     k2_confidence: k2 ? (signals.some(x => /K2:(option=com_k2|components\/com_k2|component\/k2)/.test(x)) ? 'high' : 'medium') : 'unknown',
     joomla_version: version || 'unknown', version_confidence: confidence, version_source: source,
+    opencart_detected: openCart ? 'yes' : 'no', opencart_confidence: ocConfidence,
+    opencart_version: ocVersion, opencart_version_confidence: ocVersionConfidence, opencart_legacy: ocLegacy,
     technical_priority: priority, priority, evidence: signals.join(' | ').slice(0, 4000) };
 }
 
@@ -441,7 +515,10 @@ function baseResult(domain) {
     domain, site_url: '', site_title: '', company_name: '', business_type: 'unknown',
     joomla_detected: 'unknown', k2_detected: 'unknown', k2_confidence: 'unknown',
     joomla_version: 'unknown', version_confidence: 'unknown', version_source: 'none',
-    technical_priority: 'low', lead_priority: 'low', priority: 'low', contact_url: '', pages_checked: 0, robots_status: '',
+    opencart_detected: 'unknown', opencart_confidence: 'unknown', opencart_version: 'unknown',
+    opencart_version_confidence: 'unknown', opencart_legacy: 'unknown',
+    technical_priority: 'low', lead_priority: 'low', lead_technology: '', priority: 'low',
+    contact_url: '', pages_checked: 0, robots_status: '',
     scan_status: 'error', evidence: '', error: '', checked_at: new Date().toISOString()
   };
 }
@@ -500,6 +577,7 @@ export async function scanDomain(domain, settings = {}, deps = {}) {
   }
   Object.assign(record, classify(pages, manifestVersion));
   record.scan_status = 'ok';
+  record.lead_technology = leadTechnology(record);
   record.lead_priority = prospectPriority(record);
   return record;
 }
@@ -547,7 +625,11 @@ export async function runBatch(opts, deps = {}) {
   }
   let leads = await save();
   for (const { item, cached: previous } of queue) {
-    if (previous && (previous.scan_status === 'ok' || !opts.retryErrors)) { skipped++; continue; }
+    const needsOpenCartScan = opts.rescanOpenCart && previous?.scan_status === 'ok' &&
+      previous.opencart_detected === 'unknown';
+    if (previous && !needsOpenCartScan && (previous.scan_status === 'ok' || !opts.retryErrors)) {
+      skipped++; continue;
+    }
     if (scanned >= opts.maxSites) break;
     const result = await scan(item.domain, opts);
     const merged = normalizeCachedRow({ ...result, ...item,
@@ -557,7 +639,8 @@ export async function runBatch(opts, deps = {}) {
     scanned++;
     leads = await save();
     console.log(`[${scanned}] ${item.domain}: ${merged.scan_status}, K2=${merged.k2_detected}, ` +
-      `Joomla=${merged.joomla_version}, tech=${merged.technical_priority}, lead=${merged.lead_priority}` +
+      `Joomla=${merged.joomla_version}, OpenCart=${merged.opencart_version}/${merged.opencart_legacy}, ` +
+      `tech=${merged.technical_priority}, lead=${merged.lead_priority}` +
       (merged.error ? `, ${merged.error}` : ''));
   }
   console.log(`Scanned: ${scanned}, skipped cached: ${skipped}, leads: ${leads.length}. Files: ${opts.output}, ${opts.leads}`);
@@ -565,7 +648,7 @@ export async function runBatch(opts, deps = {}) {
 }
 
 function help() {
-  return `Joomla K2 Finder 1.1 — low-rate public Joomla/K2 discovery (Node.js 22+)
+  return `Legacy CMS Finder 1.2 — low-rate public Joomla/K2/OpenCart discovery (Node.js 22+)
 
 Usage:
   node finder.mjs --input domains.txt --output results.csv --leads leads.csv --ru-only
@@ -574,9 +657,10 @@ Usage:
 Options:
   --input PATH       TXT or CSV with domain/url/site/домен column
   --output PATH      Full report CSV (default results.csv)
-  --leads PATH       Russian K2 prospects CSV (default leads.csv)
+  --leads PATH       Russian Joomla/K2 and legacy OpenCart prospects CSV (default leads.csv)
   --ru-only          Scan only .ru and .рф domains
   --retry-errors     Retry cached failed or blocked checks (never bypass robots.txt)
+  --rescan-opencart   Recheck completed rows from old reports lacking OpenCart detection
   --fresh            Ignore existing CSV and start a new report
   --delay MS         Delay between HTTP requests (default 1500, min 1000)
   --timeout MS       Request timeout (default 10000)
@@ -597,6 +681,7 @@ function cliArgs(args) {
     if (key === '--manifest') { vals.manifest = true; continue; }
     if (key === '--ru-only') { vals.ruOnly = true; continue; }
     if (key === '--retry-errors') { vals.retryErrors = true; continue; }
+    if (key === '--rescan-opencart') { vals.rescanOpenCart = true; continue; }
     if (key === '--fresh') { vals.fresh = true; continue; }
     const names = { '--input': 'input', '--output': 'output', '--leads': 'leads', '--delay': 'delay', '--timeout': 'timeout',
       '--max-pages': 'maxPages', '--max-sites': 'maxSites' };
