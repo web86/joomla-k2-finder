@@ -170,3 +170,66 @@ test('CSV writes neutralize formula-like titles', () => {
   const csv = csvStringify([{domain:'test.ru',site_title:'=HYPERLINK(\"x\")'}], ['domain','site_title']);
   assert.ok(csv.includes("'=HYPERLINK"));
 });
+
+test('detects OpenCart 2-style storefront assets without inventing an exact version', () => {
+  const p = parsePage('<link href="/catalog/view/theme/default/stylesheet/stylesheet.css">' +
+    '<script src="/catalog/view/javascript/common.js"></script>' +
+    '<a href="index.php?route=product/product&product_id=9">Product</a>', 'https://shop.ru/');
+  const result = classify([p]);
+  assert.equal(result.opencart_detected, 'yes');
+  assert.equal(result.opencart_confidence, 'high');
+  assert.equal(result.opencart_legacy, 'possible');
+  assert.equal(result.opencart_version_confidence, 'low');
+  assert.equal(result.opencart_version, '1.x–3.x (asset hypothesis)');
+  assert.equal(result.k2_detected, 'no');
+  assert.equal(result.technical_priority, 'medium');
+  assert.equal(eligibleLead({...result, domain:'shop.ru', scan_status:'ok'}), true);
+});
+
+test('generator version distinguishes obsolete OpenCart from current storefront', () => {
+  const old = classify([parsePage('<meta name="generator" content="OpenCart 2.1.0.2">' +
+    '<a href="index.php?route=product/product&product_id=2">View</a>', 'https://old.ru/')]);
+  assert.equal(old.opencart_version, '2.1.0.2');
+  assert.equal(old.opencart_legacy, 'yes');
+  assert.equal(old.opencart_version_confidence, 'high');
+  assert.equal(old.technical_priority, 'high');
+  const modern = classify([parsePage('<meta name="generator" content="OpenCart 4.1.0.3">', 'https://modern.ru/')]);
+  assert.equal(modern.opencart_detected, 'yes');
+  assert.equal(modern.opencart_legacy, 'no');
+  assert.equal(modern.technical_priority, 'low');
+  assert.equal(eligibleLead({...modern, domain:'modern.ru', scan_status:'ok'}), false);
+});
+
+test('generic OpenCart routes are not sufficient on their own; conflicting assets need review', () => {
+  const onlyRoute = classify([parsePage('<a href="index.php?route=product/product&product_id=7">Item</a>', 'https://a.ru/')]);
+  assert.equal(onlyRoute.opencart_detected, 'no');
+  const conflict = classify([parsePage('<meta name="generator" content="OpenCart 4.0.2.3">' +
+    '<link href="/catalog/view/theme/default/stylesheet/stylesheet.css">', 'https://b.ru/')]);
+  assert.equal(conflict.opencart_version_confidence, 'conflict');
+  assert.equal(conflict.opencart_legacy, 'unknown');
+  assert.equal(eligibleLead({...conflict, domain:'b.ru', scan_status:'ok'}), false);
+});
+
+test('old CSV remains unknown for OpenCart and rescans only when requested', async () => {
+  const old = normalizeCachedRow({domain:'a.ru',scan_status:'ok',joomla_detected:'no',
+    k2_detected:'no',priority:'low'});
+  assert.equal(old.opencart_detected, 'unknown');
+  assert.equal(old.opencart_legacy, 'unknown');
+  assert.equal(eligibleLead(old), false);
+  const dir = await mkdtemp(join(tmpdir(),'legacy-cms-'));
+  const input = join(dir,'input.txt'), output=join(dir,'results.csv'), leads=join(dir,'leads.csv');
+  await writeFile(input,'a.ru');
+  await writeFile(output,csvStringify([old]));
+  const called=[];
+  const scan=async domain=> { called.push(domain); return {domain,scan_status:'ok',opencart_detected:'yes',
+    opencart_confidence:'high',opencart_legacy:'possible',opencart_version:'1.x–3.x (asset hypothesis)',
+    opencart_version_confidence:'low',k2_detected:'no',technical_priority:'medium'}; };
+  const opts={input,output,leads,ruOnly:true,retryErrors:false,fresh:false,maxSites:10};
+  const first=await runBatch(opts,{scan});
+  assert.equal(first.scanned,0);
+  const second=await runBatch({...opts,rescanOpenCart:true},{scan});
+  assert.equal(second.scanned,1);
+  assert.deepEqual(called,['a.ru']);
+  assert.equal(second.leads.length,1);
+  assert.equal(second.leads[0].lead_technology,'opencart_legacy');
+});
